@@ -11,6 +11,12 @@ from .slicing.slicing import *
 from .sensor_solution import Solution
 
 from typing import Optional, Iterable, Union
+try:
+    import cupy as cp
+except ImportError:
+    cupy_imported = False
+else:
+    cupy_imported = True
 
 
 def solve_steady_state(
@@ -273,3 +279,255 @@ def steady_state_solve_stack(eom: np.ndarray, const: np.ndarray) -> np.ndarray:
     
     sol = np.linalg.solve(eom, -const)
     return sol
+
+
+def solve_eom_cupy(cpu_hamiltonian_array: np.ndarray, cpu_gamma_matrix_array: np.ndarray) -> np.ndarray:
+    """
+    Create the optical bloch equations for a hamiltonian and decoherence matrix
+    using the Lindblad master equation.
+
+    """
+    
+    if not cpu_hamiltonian_array.shape[-2:] == cpu_gamma_matrix_array.shape[-2:]:
+        raise ValueError("hamiltonian and gamma matrix must have matching shape")
+    if not cpu_hamiltonian_array.shape[-1] == cpu_hamiltonian_array.shape[-2]:
+        raise ValueError("hamiltonian and gamma matrix must be square")
+    if not len(cpu_hamiltonian_array.shape)==3:
+        raise ValueError("hamiltonian and gamma matrix must be serialized")
+    MaxPieceSize = 250000
+    basis_size = cpu_hamiltonian_array.shape[-1]
+    cpu_full_stack_length = cpu_hamiltonian_array.shape[0]
+    cpu_full_solutions = np.zeros(shape=(cpu_full_stack_length, basis_size**2-1),dtype=np.float64)
+    for StartIndex in range(0,len(cpu_hamiltonian_array),MaxPieceSize):
+        if (StartIndex + MaxPieceSize)>=cpu_hamiltonian_array.shape[0]:
+            hamiltonian = cp.array(cpu_hamiltonian_array[StartIndex:])
+            gamma_matrix = cp.array(cpu_gamma_matrix_array[StartIndex:])
+        else:
+            hamiltonian = cp.array(cpu_hamiltonian_array[StartIndex:StartIndex + MaxPieceSize])
+            gamma_matrix = cp.array(cpu_gamma_matrix_array[StartIndex:StartIndex + MaxPieceSize])
+        
+        stack_length = hamiltonian.shape[0]
+        
+        
+        
+        U, U_Inverse = get_basis_transform(basis_size)
+        gpu_U = cp.asarray(U[1:,1:])
+        gpu_U_Inverse = cp.asarray(U_Inverse[1:,1:])
+        gpu_rho = cp.zeros((basis_size,basis_size,basis_size,basis_size), dtype=cp.complex128)
+        for i in range(basis_size):
+            for j in range(basis_size):
+                gpu_rho[i,j,i,j] = 1.0 + 0.0j
+        
+        
+        """
+        Calculate the first term of the Lindblad master equation.
+        
+        """
+        
+        stackshape_11nn = (stack_length, 1, 1, basis_size, basis_size)
+        stackshape_111n = (stack_length, 1, 1, 1, basis_size)
+        stackshape_n2n2 = (stack_length, basis_size**2, basis_size**2)
+        
+        hamiltonian_exp = hamiltonian.reshape(stackshape_11nn)
+        
+        
+        hamiltonian_term_super: cp.ndarray = -1j*(hamiltonian_exp @ gpu_rho - gpu_rho @ hamiltonian_exp)
+        hamiltonian_term_super = hamiltonian_term_super.reshape(stackshape_n2n2)
+        
+        """
+        Determine the second term of the Lindblad master equation.
+    
+        """
+        
+        gamma_exp = gamma_matrix.reshape(stackshape_11nn)
+        g = cp.multiply((cp.sum(gamma_matrix, axis=-1)).reshape(stackshape_111n),gpu_rho)
+        
+        g_T = cp.swapaxes(cp.swapaxes(g,-2,-3),-1,-4)
+        
+        decoherence_term_super: cp.ndarray = cp.swapaxes((cp.matmul(gpu_rho,cp.matmul(gamma_exp,gpu_rho))), -2, -3) - (g_T + g)/2
+        decoherence_term_super = decoherence_term_super.reshape(stackshape_n2n2)
+        
+        # create optical bloch equations
+        ob_equations: cp.ndarray = hamiltonian_term_super + decoherence_term_super
+        
+        
+        """
+        Remove the ground state from the equations of motion using population conservation.
+    
+        """
+    
+        # basis_size = int(cp.sqrt(ob_equations.shape[-1]))
+        eqn_size = ob_equations.shape[-1]
+    
+        # get the constant term
+        eqns_column1 = ob_equations[:,:,0]
+        constant_term = ob_equations[:,1:,0]
+    
+        # find the indices where populations need to be subtracted
+        plocations = cp.asarray([(basis_size+1)*x for x in range(basis_size)])
+        pvector = cp.asarray([int(i in plocations) for i in range(eqn_size)])
+        
+        # make a matrix to subtract populations
+        pop_subtract = cp.einsum('ij,k', eqns_column1, pvector)
+        
+        # subtract populations
+        equation_new = ob_equations - pop_subtract
+    
+        # remove the ground state
+        equations_reduced = equation_new[:, 1:, 1:]
+    
+        """
+        Converts equations of motion from complex basis to real basis.
+    
+        """
+        # Define the basis for printout purposes for ground removed or not removed
+    
+    
+        # transform to the real basis
+        gpu_Eom = cp.real(cp.matmul(gpu_U,cp.matmul(equations_reduced,gpu_U_Inverse)))
+        # print('gpu_U.shape=' + str(gpu_U.shape))
+        # print('constant_term.shape=' + str(constant_term.shape))
+        
+        # gpu_Const = cp.real(cp.matmul(gpu_U, constant_term))
+        gpu_Const = cp.real(cp.einsum('jk,ik',gpu_U, constant_term))
+        
+        gpu_Sol = cp.linalg.solve(gpu_Eom, -gpu_Const)
+        cpu_Sol = cp.asnumpy(gpu_Sol)
+        
+        if (StartIndex + MaxPieceSize)>=cpu_hamiltonian_array.shape[0]:
+            cpu_full_solutions[StartIndex:] = cpu_Sol
+        else:
+            cpu_full_solutions[StartIndex:StartIndex + MaxPieceSize] = cpu_Sol
+        
+    return cpu_full_solutions
+
+
+
+def solve_steady_state_cupy(
+        sensor: Sensor, doppler: bool = False, doppler_mesh_method: Optional[MeshMethod] = None,
+        sum_doppler: bool = True, weight_doppler: bool = True):
+    solution = Solution()
+
+    # relevant sensor-related quantities
+    stack_shape = tuple(sensor._stack_shape())
+    basis_size = sensor.basis_size
+    spatial_dim = sensor.spatial_dim()
+    
+    # initialize doppler-related quantities
+    doppler_axis_shape: Iterable[int] = ()
+    dop_classes = None
+    doppler_shifts = None
+    doppler_axes: Iterable[slice] = ()
+    
+    # update doppler-related values
+    if doppler:
+        dop_classes = doppler_classes(method=doppler_mesh_method)
+        doppler_shifts = sensor.get_doppler_shifts()
+        doppler_axis_shape = tuple(len(dop_classes) for _ in range(spatial_dim))
+
+        if not sum_doppler:
+            doppler_axes = tuple(slice(None) for _ in range(spatial_dim))
+
+    
+    # allocate arrays
+    hamiltonians_constant = sensor.get_hamiltonian()
+    hamiltonians_time, _ = sensor.get_time_couplings()
+    H =  hamiltonians_constant + np.sum(hamiltonians_time, axis=0)
+    G =  sensor.decoherence_matrix()
+    
+    sol_basis_size = basis_size**2-1
+    sol_basis_size_tuple = tuple([sol_basis_size])
+    
+    if doppler and weight_doppler and not sum_doppler:    
+        out_sol_shape = doppler_axis_shape + stack_shape + sol_basis_size_tuple
+    else:
+        out_sol_shape = stack_shape + sol_basis_size_tuple
+    
+    if doppler:
+        dop_classes = doppler_classes(method=doppler_mesh_method)
+        doppler_shifts = sensor.get_doppler_shifts()
+        dop_volumes = np.gradient(doppler_velocities)  # smoothly handles irregular arrays
+        # generate the velocity meshgrids
+        dets = [doppler_velocities for _ in range(spatial_dim)]
+        diffs = [dop_volumes for _ in range(spatial_dim)]
+        H_flattened = H.reshape((np.prod(H.shape[:-2],basis_size,basis_size)))
+        G_flattened = G.reshape((np.prod(G.shape[:-2],basis_size,basis_size)))
+        # Create array of all possible velocity vector combinations:
+        #       shape = (len(doppler_classes)**spatial_dim,spatial_dim)
+        Vs_serialized = [i for i in itertools.product(dets)]
+        
+        # Create array of summed hamiltonians times their 
+        # respective velocity components using Einstein summation.
+        # This takes a doppler list of velocity vectors:
+        #       shape = (len(doppler_classes)**spatial_dim,spatial_dim)
+        # And a hamiltonians for every spatial dimension:
+        #       shape = (spatial_dim,basis_size,basis_size)
+        # And creates a summed hamiltonian for all velocity vectors:
+        #       shape = (len(doppler_classes)**spatial_dim,basis_size,basis_size)
+        # This maintains the ordering for reshaping to expected output.
+        Vs_H_flattened = np.einsum(
+            'ij,jkl->ikl', 
+            Vs_serialized, 
+            doppler_shifts)
+        
+        # Get Cartesian product and add all possible combinations of 
+        # Hamiltonians based on Doppler shift and other parameters:
+        hamiltonians_serialized= np.einsum('ijkl->ikl', \
+            np.array([i for i in itertools.product(
+                Vs_H_flattened, H_flattened)]))
+        gamma_matrix_serialized = np.array([G_flattened for _ in range(len(Vs_H_flattened))])
+        # doppler_axis_length = len(Vs)
+        # base_doppler_shift_eoms = generate_doppler_shift_eom(doppler_hamiltonians)
+        sols_serialized = solve_eom_cupy(hamiltonians_serialized, gamma_matrix_serialized)
+        sols_doppler_shaped = sols_serialized.reshape(
+            (len(Vs_H_flattened),len(H_flattened),basis_size**2-1))
+        if weight_doppler:
+            # Vs_meshgrid, H_meshgrid = np.meshgrid(Vs,H,indexing='ij'])
+            # Get Cartesian product and add all possible combinations of weights:
+            Vols_tuples_serialized = np.array([i for i in itertools.product(*diffs)]) # np.array(np.meshgrid(*diffs,indexing="ij"))
+            
+            
+            # Get gaussian3d function in serialized output form
+            spatial_dim = Vs_serialized.shape[-1]
+            if spatial_dim > 3:
+                raise ValueError(f"Too many axes supplied: {spatial_dim}")
+
+            prefactor = np.power(1/(np.pi),spatial_dim*0.5)
+            squared_mag_array = np.square(Vs_serialized).sum(axis=-1)
+            weights_serialized = prefactor*np.exp(-squared_mag_array)
+            
+            # Get elementwise product of all the weight dimensions
+            Vols_serialized = [np.prod(i) for i in Vols_tuples_serialized]
+            weighted_vols = Vols_serialized*weights_serialized
+            sols_weighted = np.einsum(
+                'ijk,i->ijk', 
+                sols_doppler_shaped, 
+                weighted_vols)
+            if sum_doppler:
+                sols = np.sum(sols_weighted, axis=0).reshape(out_sol_shape)
+            else:
+                sols = sols_weighted.reshape(out_sol_shape)
+        else:
+            sols = sols_serialized.reshape(out_sol_shape)
+    else:
+        hamiltonians_serialized = H
+        hamiltonians_serialized = hamiltonians_serialized.reshape((np.prod(H.shape[:-2]),basis_size,basis_size))
+        gamma_matrix_serialized = G
+        gamma_matrix_serialized = gamma_matrix_serialized.reshape((np.prod(G.shape[:-2]),basis_size,basis_size))
+        sols_flattened = solve_eom_cupy(hamiltonians_serialized, gamma_matrix_serialized)
+        sols = sols_flattened.reshape(out_sol_shape)
+    solution.rho = sols
+    solution.eta = sensor.eta
+    solution.kappa = sensor.kappa
+    solution.couplings = sensor.get_couplings()
+    solution.axis_labels = ([f'doppler_{i:d}' for i in range(spatial_dim) if not sum_doppler]
+                            + sensor.axis_labels()
+                            + ["density_matrix"])
+    solution.axis_values = ([dop_classes for i in range(spatial_dim) if not sum_doppler]
+                            + [val for _,_,val in sensor.variable_parameters()]
+                            + [sensor.basis()])
+    solution.basis = sensor.basis()
+    solution.rq_version = version("rydiqule")
+    solution.doppler_classes = dop_classes
+    
+    return solution

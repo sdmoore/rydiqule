@@ -24,6 +24,10 @@ def solve_steady_state(
         sum_doppler: bool = True, weight_doppler: bool = True, 
         n_slices: Union[int, None] = None,
         ) -> Solution:
+    if cupy_imported:
+        return solve_steady_state_cupy(
+            sensor = sensor, doppler = doppler, doppler_mesh_method = doppler_mesh_method,
+            sum_doppler = sum_doppler, weight_doppler = weight_doppler)
     """
     Finds the steady state solution for a system characterized by a sensor.
 
@@ -281,7 +285,7 @@ def steady_state_solve_stack(eom: np.ndarray, const: np.ndarray) -> np.ndarray:
     return sol
 
 
-def solve_eom_cupy(cpu_hamiltonian_array: np.ndarray, cpu_gamma_matrix_array: np.ndarray) -> np.ndarray:
+def solve_eom_cupy(cpu_hamiltonian_array: np.ndarray, cpu_gamma_matrix_array: np.ndarray, MaxPieceSize: int = 200000) -> np.ndarray:
     """
     Create the optical bloch equations for a hamiltonian and decoherence matrix
     using the Lindblad master equation.
@@ -294,17 +298,16 @@ def solve_eom_cupy(cpu_hamiltonian_array: np.ndarray, cpu_gamma_matrix_array: np
         raise ValueError("hamiltonian and gamma matrix must be square")
     if not len(cpu_hamiltonian_array.shape)==3:
         raise ValueError("hamiltonian and gamma matrix must be serialized")
-    MaxPieceSize = 250000
+    
     basis_size = cpu_hamiltonian_array.shape[-1]
     cpu_full_stack_length = cpu_hamiltonian_array.shape[0]
     cpu_full_solutions = np.zeros(shape=(cpu_full_stack_length, basis_size**2-1),dtype=np.float64)
-    for StartIndex in range(0,len(cpu_hamiltonian_array),MaxPieceSize):
-        if (StartIndex + MaxPieceSize)>=cpu_hamiltonian_array.shape[0]:
-            hamiltonian = cp.array(cpu_hamiltonian_array[StartIndex:])
-            gamma_matrix = cp.array(cpu_gamma_matrix_array[StartIndex:])
-        else:
-            hamiltonian = cp.array(cpu_hamiltonian_array[StartIndex:StartIndex + MaxPieceSize])
-            gamma_matrix = cp.array(cpu_gamma_matrix_array[StartIndex:StartIndex + MaxPieceSize])
+
+    ListOfStartIndex = [StartIndex for StartIndex in range(0,cpu_full_stack_length,MaxPieceSize)]
+    ListOfStartEndIndex = [(StartIndex,min(StartIndex+MaxPieceSize,cpu_full_stack_length)) for StartIndex in ListOfStartIndex]
+    for StartEndTupleIndex in ListOfStartEndIndex:
+        hamiltonian = cp.asarray(cpu_hamiltonian_array[StartEndTupleIndex[0]:StartEndTupleIndex[1]][:][:])
+        gamma_matrix = cp.asarray(cpu_gamma_matrix_array[StartEndTupleIndex[0]:StartEndTupleIndex[1]][:][:])
         
         stack_length = hamiltonian.shape[0]
         
@@ -393,11 +396,8 @@ def solve_eom_cupy(cpu_hamiltonian_array: np.ndarray, cpu_gamma_matrix_array: np
         
         gpu_Sol = cp.linalg.solve(gpu_Eom, -gpu_Const)
         cpu_Sol = cp.asnumpy(gpu_Sol)
+        cpu_full_solutions[StartEndTupleIndex[0]:StartEndTupleIndex[1]][:] = cpu_Sol[:][:]
         
-        if (StartIndex + MaxPieceSize)>=cpu_hamiltonian_array.shape[0]:
-            cpu_full_solutions[StartIndex:] = cpu_Sol
-        else:
-            cpu_full_solutions[StartIndex:StartIndex + MaxPieceSize] = cpu_Sol
         
     return cpu_full_solutions
 
@@ -446,15 +446,29 @@ def solve_steady_state_cupy(
     if doppler:
         dop_classes = doppler_classes(method=doppler_mesh_method)
         doppler_shifts = sensor.get_doppler_shifts()
-        dop_volumes = np.gradient(doppler_velocities)  # smoothly handles irregular arrays
+        dop_volumes = np.gradient(dop_classes)  # smoothly handles irregular arrays
         # generate the velocity meshgrids
-        dets = [doppler_velocities for _ in range(spatial_dim)]
+        dets = [dop_classes for _ in range(spatial_dim)]
         diffs = [dop_volumes for _ in range(spatial_dim)]
-        H_flattened = H.reshape((np.prod(H.shape[:-2],basis_size,basis_size)))
-        G_flattened = G.reshape((np.prod(G.shape[:-2],basis_size,basis_size)))
+        H_flattened = np.reshape(H,newshape=(int(round(np.prod(H.shape[:-2]))),basis_size,basis_size))
+        G_flattened = np.reshape(G,newshape=(int(round(np.prod(G.shape[:-2]))),basis_size,basis_size))
+        
         # Create array of all possible velocity vector combinations:
         #       shape = (len(doppler_classes)**spatial_dim,spatial_dim)
-        Vs_serialized = [i for i in itertools.product(dets)]
+        Vs_serialized_array = []
+        if len(dets)==1:
+            for i in dop_classes:
+                Vs_serialized_array.append([i])
+        elif len(dets)==2:
+            for i in dop_classes:
+                for j in dop_classes:
+                    Vs_serialized_array.append([i,j])
+        elif len(dets)==3:
+            for i in dop_classes:
+                for j in dop_classes:
+                    for k in dop_classes:
+                        Vs_serialized_array.append([i,j,k])
+        Vs_serialized = np.array(Vs_serialized_array)
         
         # Create array of summed hamiltonians times their 
         # respective velocity components using Einstein summation.
@@ -475,7 +489,8 @@ def solve_steady_state_cupy(
         hamiltonians_serialized= np.einsum('ijkl->ikl', \
             np.array([i for i in itertools.product(
                 Vs_H_flattened, H_flattened)]))
-        gamma_matrix_serialized = np.array([G_flattened for _ in range(len(Vs_H_flattened))])
+        gamma_matrix_serialized_unflattened = np.array([G_flattened for _ in range(len(Vs_H_flattened))])
+        gamma_matrix_serialized = np.reshape(gamma_matrix_serialized_unflattened,newshape=hamiltonians_serialized.shape)
         # doppler_axis_length = len(Vs)
         # base_doppler_shift_eoms = generate_doppler_shift_eom(doppler_hamiltonians)
         sols_serialized = solve_eom_cupy(hamiltonians_serialized, gamma_matrix_serialized)
@@ -510,10 +525,8 @@ def solve_steady_state_cupy(
         else:
             sols = sols_serialized.reshape(out_sol_shape)
     else:
-        hamiltonians_serialized = H
-        hamiltonians_serialized = hamiltonians_serialized.reshape((np.prod(H.shape[:-2]),basis_size,basis_size))
-        gamma_matrix_serialized = G
-        gamma_matrix_serialized = gamma_matrix_serialized.reshape((np.prod(G.shape[:-2]),basis_size,basis_size))
+        hamiltonians_serialized = np.reshape(H,newshape=(int(round(np.prod(H.shape[:-2]))),basis_size,basis_size))
+        gamma_matrix_serialized = np.reshape(G,newshape=(int(round(np.prod(G.shape[:-2]))),basis_size,basis_size))
         sols_flattened = solve_eom_cupy(hamiltonians_serialized, gamma_matrix_serialized)
         sols = sols_flattened.reshape(out_sol_shape)
     solution.rho = sols
